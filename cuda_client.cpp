@@ -1615,6 +1615,7 @@ lupine_translate_private_function_for_rpc(CUfunction function) {
 extern "C" bool
 lupine_device_attribute_is_virtualized(CUdevice_attribute attrib) {
   switch (attrib) {
+  case CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM:
   case CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS:
   case CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES:
   case CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS:
@@ -5932,37 +5933,21 @@ lupine_params_from_param_buffer(void **extra,
   return params->data();
 }
 
-struct lupine_kernel_params {
-  std::vector<CUdeviceptr> translated_pointers;
-  std::vector<void *> pointers;
-  std::vector<CUdeviceptr> managed;
-};
-
-static CUresult lupine_translate_kernel_params(lupine_route route,
-                                               void *const *kernel_params,
-                                               const std::vector<size_t> &sizes,
-                                               lupine_kernel_params *params) {
-  params->translated_pointers.resize(sizes.size());
-  params->pointers.resize(sizes.size());
+static CUresult
+lupine_prepare_kernel_params(lupine_route route, void *const *kernel_params,
+                             const std::vector<size_t> &sizes,
+                             std::vector<CUdeviceptr> *managed) {
+  bool portable = false;
   for (size_t i = 0; i < sizes.size(); ++i) {
-    params->pointers[i] = kernel_params[i];
     if (sizes[i] == sizeof(CUdeviceptr)) {
-      memcpy(&params->translated_pointers[i], kernel_params[i],
-             sizeof(CUdeviceptr));
-      bool managed = false;
-      CUresult result = lupine_translate_mapped_host_pointer(
-          route, params->translated_pointers[i],
-          &params->translated_pointers[i], &managed);
-      if (result != CUDA_SUCCESS) {
-        return result;
+      CUdeviceptr value;
+      memcpy(&value, kernel_params[i], sizeof(value));
+      if (lupine_prepare_mapped_host_pointer(value, &portable)) {
+        managed->push_back(value);
       }
-      if (managed) {
-        params->managed.push_back(params->translated_pointers[i]);
-      }
-      params->pointers[i] = &params->translated_pointers[i];
     }
   }
-  return CUDA_SUCCESS;
+  return lupine_prepare_portable_host_allocations(route, portable);
 }
 
 static std::vector<rpc_write_cursor>
@@ -6090,19 +6075,19 @@ cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
   }
 
   uint32_t param_count = static_cast<uint32_t>(param_sizes.size());
-  lupine_kernel_params params;
+  std::vector<CUdeviceptr> managed;
   status =
-      lupine_translate_kernel_params(route, kernelParams, param_sizes, &params);
+      lupine_prepare_kernel_params(route, kernelParams, param_sizes, &managed);
   if (status != CUDA_SUCCESS) {
     return status;
   }
   if (lupine_route_is_local(route)) {
     return lupine_call_real_cuda_fn(
         "cuLaunchKernel", f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY,
-        blockDimZ, sharedMemBytes, hStream, params.pointers.data(), nullptr);
+        blockDimZ, sharedMemBytes, hStream, kernelParams, nullptr);
   }
   std::vector<rpc_write_cursor> rpc_params =
-      lupine_kernel_param_cursors(params.pointers.data(), param_sizes);
+      lupine_kernel_param_cursors(kernelParams, param_sizes);
   conn_t *conn = lupine_route_remote_conn(route);
   if (lupine_prepare_rpc(conn) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
@@ -6127,7 +6112,7 @@ cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
       rpc_write_end(conn) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
-  for (CUdeviceptr pointer : params.managed) {
+  for (CUdeviceptr pointer : managed) {
     lupine_invalidate_launched_managed(pointer, hStream);
   }
   return CUDA_SUCCESS;
@@ -6181,18 +6166,18 @@ extern "C" CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
   }
 
   uint32_t param_count = static_cast<uint32_t>(param_sizes.size());
-  lupine_kernel_params params;
+  std::vector<CUdeviceptr> managed;
   status =
-      lupine_translate_kernel_params(route, kernelParams, param_sizes, &params);
+      lupine_prepare_kernel_params(route, kernelParams, param_sizes, &managed);
   if (status != CUDA_SUCCESS) {
     return status;
   }
   if (lupine_route_is_local(route)) {
     return lupine_call_real_cuda_fn<CUDA_ERROR_NOT_SUPPORTED>(
-        "cuLaunchKernelEx", config, f, params.pointers.data(), nullptr);
+        "cuLaunchKernelEx", config, f, kernelParams, nullptr);
   }
   std::vector<rpc_write_cursor> rpc_params =
-      lupine_kernel_param_cursors(params.pointers.data(), param_sizes);
+      lupine_kernel_param_cursors(kernelParams, param_sizes);
   conn_t *conn = lupine_route_remote_conn(route);
   if (lupine_prepare_rpc(conn) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
@@ -6212,7 +6197,7 @@ extern "C" CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
       rpc_write_end(conn) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
-  for (CUdeviceptr pointer : params.managed) {
+  for (CUdeviceptr pointer : managed) {
     lupine_invalidate_launched_managed(pointer, config->hStream);
   }
   return CUDA_SUCCESS;
@@ -6245,20 +6230,19 @@ cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX,
   }
 
   uint32_t param_count = static_cast<uint32_t>(param_sizes.size());
-  lupine_kernel_params params;
+  std::vector<CUdeviceptr> managed;
   status =
-      lupine_translate_kernel_params(route, kernelParams, param_sizes, &params);
+      lupine_prepare_kernel_params(route, kernelParams, param_sizes, &managed);
   if (status != CUDA_SUCCESS) {
     return status;
   }
   if (lupine_route_is_local(route)) {
     return lupine_call_real_cuda_fn(
         "cuLaunchCooperativeKernel", f, gridDimX, gridDimY, gridDimZ, blockDimX,
-        blockDimY, blockDimZ, sharedMemBytes, hStream,
-        params.pointers.data());
+        blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams);
   }
   std::vector<rpc_write_cursor> rpc_params =
-      lupine_kernel_param_cursors(params.pointers.data(), param_sizes);
+      lupine_kernel_param_cursors(kernelParams, param_sizes);
 
   conn_t *conn = lupine_route_remote_conn(route);
   if (lupine_prepare_rpc(conn) < 0) {
@@ -6284,7 +6268,7 @@ cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX,
       rpc_write_end(conn) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
-  for (CUdeviceptr pointer : params.managed) {
+  for (CUdeviceptr pointer : managed) {
     lupine_invalidate_launched_managed(pointer, hStream);
   }
   return CUDA_SUCCESS;
