@@ -6947,6 +6947,9 @@ int handle_cuGraphExecUpdate_v2(conn_t *conn) {
 
   return_value = cuGraphExecUpdate_v2(hGraphExec, hGraph, &resultInfo);
 
+  if (return_value == CUDA_SUCCESS)
+    lupine_rebind_graph_exec_resources(hGraphExec, hGraph);
+
   if (rpc_write_start_response(conn, request_id) < 0 ||
       rpc_write(conn, &resultInfo, sizeof(CUgraphExecUpdateResultInfo)) < 0 ||
       rpc_write(conn, &return_value, sizeof(CUresult)) < 0 ||
@@ -9485,6 +9488,9 @@ int handle_cuGraphExecUpdate(conn_t *conn) {
   return_value = cuGraphExecUpdate(
       hGraphExec, hGraph, hErrorNode_out_present ? &hErrorNode_out : nullptr,
       updateResult_out_present ? &updateResult_out : nullptr);
+
+  if (return_value == CUDA_SUCCESS)
+    lupine_rebind_graph_exec_resources(hGraphExec, hGraph);
 
   if (rpc_write_start_response(conn, request_id) < 0 ||
       (hErrorNode_out_present &&

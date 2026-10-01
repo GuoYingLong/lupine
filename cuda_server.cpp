@@ -833,6 +833,7 @@ void lupine_cleanup_pending_dtoh_copies(
     return;
   }
   for (auto &copy : *pending) {
+    lupine_release_graph_resources(copy.graph_resources);
     if (copy.server_src == nullptr) {
       continue;
     }

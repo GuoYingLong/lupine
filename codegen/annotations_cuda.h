@@ -2804,6 +2804,7 @@ CUresult cuGraphDestroy(CUgraph hGraph) {
 #undef cuGraphExecUpdate
 #endif
 /**
+ * @graphexecupdate hGraphExec hGraph
  * @param hGraphExec SEND_ONLY
  * @param hGraph SEND_ONLY
  * @param hErrorNode_out RECV_ONLY NULLABLE
@@ -2813,6 +2814,7 @@ CUresult cuGraphExecUpdate(CUgraphExec hGraphExec, CUgraph hGraph,
                            CUgraphNode *hErrorNode_out,
                            CUgraphExecUpdateResult *updateResult_out);
 /**
+ * @graphexecupdate hGraphExec hGraph
  * @param hGraphExec SEND_ONLY
  * @param hGraph SEND_ONLY
  * @param resultInfo SEND_RECV
