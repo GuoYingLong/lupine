@@ -1,5 +1,6 @@
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -28,6 +29,7 @@
 #include "ipc.h"
 #include "lupine_log.h"
 #include "monitoring.h"
+#include "process_handoff.h"
 #include "rpc.h"
 #include "rpc_server.h"
 #ifdef LUPINE_BUILD_CUDA_BACKEND
@@ -184,6 +186,18 @@ struct lupine_lane {
 int rpc_server_dispatch(const rpc_handler_registry &handlers, conn_t *conn,
                         int op) {
   LUPINE_TRACE_LOG("LUPINE server handling op " << op);
+  if (op == LUPINE_HANDOFF_DRAIN_REQUEST) {
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+    lupine_checkpoint_drain_cuda_calls();
+#endif
+    int request = rpc_read_end(conn);
+    int result = 0;
+    return request < 0 || rpc_write_start_response(conn, request) < 0 ||
+                   rpc_write(conn, &result, sizeof(result)) < 0 ||
+                   rpc_write_end(conn) < 0
+               ? -1
+               : 0;
+  }
   if (op == LUPINE_RPC_CLIENT_METADATA) {
     return handle_lupine_client_metadata(conn);
   }
@@ -408,6 +422,7 @@ int client_handler(lupine_socket_t connfd) {
   }
   lupine_monitoring_register_child();
 #ifdef LUPINE_BUILD_CUDA_BACKEND
+  lupine_handoff_on_resume(&conn, lupine_checkpoint_resume_cuda_calls);
   if (!lupine_server_initialize_connection(&conn)) {
     LUPINE_LOG_ERROR("Error initializing per-connection CUDA state.");
     rpc_conn_destroy(&conn);
@@ -464,6 +479,35 @@ int main() {
     LUPINE_LOG_ERROR("Socket initialization failed.");
     exit(EXIT_FAILURE);
   }
+
+#ifndef _WIN32
+  if (const char *inherited = getenv("LUPINE_CONNECTION_FD")) {
+    char *end = nullptr;
+    long fd = strtol(inherited, &end, 10);
+    int type = 0;
+    socklen_t length = sizeof(type);
+    if (end == inherited || *end != '\0' || fd < 0 || fd > INT_MAX ||
+        getsockopt(static_cast<int>(fd), SOL_SOCKET, SO_TYPE, &type, &length) !=
+            0 ||
+        type != SOCK_STREAM) {
+      LUPINE_LOG_ERROR(
+          "LUPINE_CONNECTION_FD must name an inherited stream socket");
+      return EXIT_FAILURE;
+    }
+    int connfd = static_cast<int>(fd);
+    lupine_socket_apply_transport_options(connfd);
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+    bool started = lupine_server_checkpoint_child_start(connfd);
+#else
+    bool started = lupine_install_child_signal_handler(connfd);
+#endif
+    if (!started) {
+      lupine_socket_close(connfd);
+      return EXIT_FAILURE;
+    }
+    return client_handler(connfd) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+#endif
 
   lupine_socket_t sockfd = socket(AF_INET, SOCK_STREAM, 0);
   if (sockfd == LUPINE_INVALID_SOCKET) {

@@ -1,5 +1,6 @@
 #include "rpc.h"
 #include "lupine_log.h"
+#include "process_handoff.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -894,7 +895,9 @@ int rpc_write_start_request(conn_t *conn, const int op) {
   if (call_lock_result != 0) {
     return -1;
   }
-  if (conn->closed) {
+  bool callback = request_nested_in_response ||
+                  (rpc_tls_io.read_conn == conn && rpc_tls_io.read.op != -1);
+  if (lupine_handoff_request_begin(conn, op, callback) < 0 || conn->closed) {
     pthread_mutex_unlock(&conn->call_mutex);
     return -1;
   }

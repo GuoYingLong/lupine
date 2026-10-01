@@ -1,6 +1,7 @@
 #include "client_bundle.h"
 #include "lupine_log.h"
 #include "monitoring.h"
+#include "process_handoff.h"
 #include "rpc.h"
 #include "test_platform.h"
 #include "third_party/zstd/lib/common/xxhash.h"
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <nghttp2/nghttp2.h>
 #include <string>
@@ -473,6 +475,82 @@ void init_raw_server_peer(h2_pair *pair) {
       raw_read_exact(pair->server.connfd, received.data(), received.size()) &&
           memcmp(received.data(), preface, received.size()) == 0,
       "client HTTP/2 preface missing");
+}
+
+void test_process_control_preserves_queued_output() {
+  h2_pair pair;
+  init_raw_server_peer(&pair);
+  const unsigned char settings[] = {0, 0, 0, NGHTTP2_SETTINGS, 0, 0, 0, 0, 0};
+  require(raw_write_all(pair.server.connfd, settings, sizeof(settings)),
+          "server SETTINGS write failed");
+  const std::string checkpoint = "session.1";
+  int32_t stream = rpc_http2_dispatch_stream(&pair.client);
+  auto notify = [&](char command) {
+    std::vector<unsigned char> frame(9, 0);
+    frame[2] = static_cast<unsigned char>(checkpoint.size() + 1);
+    frame[3] = LUPINE_HANDOFF_CONTROL_FRAME;
+    frame.push_back(static_cast<unsigned char>(command));
+    frame.insert(frame.end(), checkpoint.begin(), checkpoint.end());
+    require(raw_write_all(pair.server.connfd, frame.data(), frame.size()),
+            "process control write failed");
+    char received;
+    std::string key;
+    require(lupine_handoff_receive_control(&pair.client, &received, &key) ==
+                    0 &&
+                received == command && key == checkpoint,
+            "process control did not preserve command and generation");
+  };
+
+  enum outcome { cancel, resume, shutdown };
+  for (outcome action : {cancel, resume, shutdown}) {
+    notify('P');
+    notify('F');
+    require(lupine_handoff_send_control(&pair.client, 'A', checkpoint) == 0,
+            "client freeze failed");
+    std::array<unsigned char, 9> header;
+    do {
+      require(raw_read_frame(pair.server.connfd, &header),
+              "freeze acknowledgment read failed");
+    } while (header[3] != LUPINE_HANDOFF_CONTROL_FRAME);
+    require(write_bytes(&pair.client, "queued", 6) == 0,
+            "queuing data during freeze failed");
+    notify(action == cancel ? 'X' : 'C');
+    if (action != cancel) {
+      require(lupine_handoff_park_socket(&pair.client) == 0,
+              "socket park failed");
+      lupine_socket_t replacement[2];
+      require(lupine_test_connected_pair(replacement),
+              "replacement pair failed");
+      lupine_socket_close(pair.client.connfd);
+      lupine_socket_close(pair.server.connfd);
+      pair.client.connfd = replacement[0];
+      pair.server.connfd = replacement[1];
+      if (action == shutdown) {
+        // Closing during an HTTP/TLS resume handshake must wake that read,
+        // even though the retained HTTP/2 reader is still parked.
+        auto reading = std::async(std::launch::async, [&] {
+          unsigned char byte;
+          return raw_read_exact(pair.client.connfd, &byte, 1);
+        });
+        rpc_shutdown_transport_socket(&pair.client);
+        require(reading.wait_for(std::chrono::seconds(1)) ==
+                        std::future_status::ready &&
+                    !reading.get(),
+                "shutdown left the resume handshake blocked");
+        break;
+      }
+      require(lupine_handoff_resume_socket(&pair.client) == 0,
+              "socket resume failed");
+    }
+    require(raw_read_frame(pair.server.connfd, &header),
+            "queued data was lost during resume");
+    int32_t received_stream = (static_cast<int32_t>(header[5]) << 24) |
+                              (static_cast<int32_t>(header[6]) << 16) |
+                              (static_cast<int32_t>(header[7]) << 8) |
+                              header[8];
+    require(header[3] == NGHTTP2_DATA && received_stream == stream,
+            "resume restarted HTTP/2 instead of retaining the stream");
+  }
 }
 
 void test_response_wait_sends_transport_heartbeat() {
@@ -2017,6 +2095,15 @@ void test_rpc_repeated_responses_on_lane() {
           "repeated response request start failed");
   int request_id = rpc_write_end(&pair.client);
   require(request_id > 0, "repeated response request write failed");
+  require(lupine_handoff_pause_requests(&pair.client) == 0,
+          "checkpoint waited for replies held by the surviving client");
+  auto next_call = std::async(std::launch::async, [&] {
+    int result = rpc_write_start_request(&pair.client, kOp);
+    return result == 0 ? rpc_write_end(&pair.client) : -1;
+  });
+  require(next_call.wait_for(std::chrono::milliseconds(20)) ==
+              std::future_status::timeout,
+          "new client request entered while checkpointing");
   for (int expected = 0; expected < kChunkCount; ++expected) {
     require(rpc_read_start(&pair.client, request_id) == 0,
             "repeated response read start failed");
@@ -2031,6 +2118,11 @@ void test_rpc_repeated_responses_on_lane() {
     require(chunk == expected, "repeated response index mismatch");
     require(received == payload, "repeated response payload mismatch");
   }
+  lupine_handoff_resume_requests(&pair.client);
+  require(next_call.wait_for(std::chrono::seconds(1)) ==
+                  std::future_status::ready &&
+              next_call.get() > 0,
+          "client request did not resume after checkpointing");
   server.join();
 }
 
@@ -2505,6 +2597,7 @@ int main() {
   RUN_CASE(test_rpc_repeated_responses_on_lane());
   RUN_CASE(test_rpc_request_nested_in_response_builder());
   RUN_CASE(test_rpc_response_completed_hook());
+  RUN_CASE(test_process_control_preserves_queued_output());
   RUN_CASE(test_response_wait_sends_transport_heartbeat());
   RUN_CASE(test_data_provider_frame_sizing());
   RUN_CASE(test_client_to_server());
